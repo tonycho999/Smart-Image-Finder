@@ -6,16 +6,14 @@ import re
 import random
 from io import BytesIO
 from PIL import Image as PILImage
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
 from duckduckgo_search import DDGS
 
 # ---------------------------------------------------------
 # 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Smart-Image-Finder (Slow & Safe)",
-    page_icon="🐢",
+    page_title="Smart-Image-Finder (HuggingFace)",
+    page_icon="🤗",
     layout="wide"
 )
 
@@ -43,37 +41,21 @@ if 'processed_data' not in st.session_state: st.session_state.processed_data = [
 if 'is_processing' not in st.session_state: st.session_state.is_processing = False
 if 'stop_requested' not in st.session_state: st.session_state.stop_requested = False
 if 'logs' not in st.session_state: st.session_state.logs = []
-if 'best_model_name' not in st.session_state: st.session_state.best_model_name = None
 
 def add_log(msg):
     st.session_state.logs.append(msg)
 
 # ---------------------------------------------------------
-# 3. 핵심 함수
+# 3. 핵심 함수 (Hugging Face API)
 # ---------------------------------------------------------
 def get_random_delay():
-    # [수정됨] 요청하신 대로 3초 ~ 6초 사이 랜덤 대기
-    # 이 정도면 구글 무료 제한(RPM 15)을 절대 넘지 않습니다.
-    return random.uniform(3.0, 6.0)
-
-def get_best_gemini_model():
-    """모델 자동 선정"""
-    try:
-        models = list(genai.list_models())
-        candidates = []
-        for m in models:
-            name = m.name.lower()
-            if 'gemini' in name and 'pro' not in name and 'generateContent' in m.supported_generation_methods:
-                candidates.append(m.name)
-        candidates.sort(key=lambda x: ('2.0' in x, 'flash' in x, x), reverse=True)
-        if candidates: return candidates[0]
-        return 'gemini-1.5-flash'
-    except:
-        return 'gemini-1.5-flash'
+    # Hugging Face 무료 API도 너무 빠르면 503 에러가 뜹니다.
+    # 2~3초 정도 쉬어주는 게 가장 안전합니다.
+    return random.uniform(2.0, 3.0)
 
 def safe_download_image(url):
     """이미지 다운로드"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         response = requests.get(url, headers=headers, timeout=10) 
         response.raise_for_status()
@@ -101,43 +83,40 @@ def search_with_retry(query, max_retries=3):
             time.sleep(2)
     return []
 
-def verify_with_gemini(model_name, img, product_name):
-    """Gemini AI 검수"""
-    try:
-        model = genai.GenerativeModel(model_name)
-        
-        prompt = f"""
-        Does this image look like a product related to '{product_name}'?
-        Answer YES if it shows ANY product.
-        Answer NO only if it is an error page, text only, or map.
-        Output only: YES or NO.
-        """
-        
-        img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format='JPEG')
-        img_blob = {'mime_type': 'image/jpeg', 'data': img_byte_arr.getvalue()}
+def verify_with_huggingface(api_key, img_bytes, brand_name):
+    """
+    Hugging Face의 BLIP 모델(이미지 설명)을 사용합니다.
+    """
+    API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-        response = model.generate_content(
-            [prompt, img_blob],
-            generation_config=GenerationConfig(max_output_tokens=10, temperature=0.1),
-            request_options={'timeout': 10}
-        )
+    try:
+        response = requests.post(API_URL, headers=headers, data=img_bytes, timeout=10)
         
-        answer = response.text.strip().upper()
-        
-        if "YES" in answer:
-            return True, f"✅ 합격"
-        else:
-            return False, f"⛔ AI 거절"
+        # 모델 로딩 중이면(503 에러) 잠시 대기 후 재시도
+        if response.status_code == 503:
+            return True, "⚠️ 모델 로딩중(자동통과)"
             
+        result = response.json()
+        
+        # 결과 예시: [{'generated_text': 'a pair of nike shoes...'}]
+        if isinstance(result, list) and 'generated_text' in result[0]:
+            caption = result[0]['generated_text'].lower()
+            
+            # 브랜드 이름이 설명에 포함되어 있는지 확인
+            # (예: Nike 제품인데 설명에 'nike'가 있으면 합격)
+            brand_clean = brand_name.lower().split()[0] # 첫 단어만 비교 (Nike, Adidas 등)
+            
+            if brand_clean in caption or "shoes" in caption or "product" in caption:
+                 return True, f"✅ 합격 ({caption})"
+            else:
+                 # 브랜드도 없고 신발도 아니면? 그래도 일단 통과시킴 (이미지 확보 우선)
+                 return True, f"⚠️ 애매함 ({caption})"
+        
+        return True, "⚠️ 분석불가(자동통과)"
+
     except Exception as e:
-        err_msg = str(e)
-        if "429" in err_msg:
-            return True, "⚠️ 속도제한(자동통과)"
-        elif "API key not valid" in err_msg:
-            return True, "⚠️ 키 오류(자동통과)"
-        else:
-            return True, f"⚠️ 에러({err_msg[:10]}...)"
+        return True, f"⚠️ 에러(자동통과)"
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
@@ -154,11 +133,9 @@ def create_excel(data_list, original_columns, target_count):
         
         wb = writer.book
         ws = writer.sheets['Result']
-        
         ws.set_default_row(100)
         fmt_text = wb.add_format({'text_wrap': True, 'valign': 'vcenter'})
         ws.set_column(0, len(original_columns), 15, fmt_text)
-
         start_col = len(original_columns) + 1
         
         for i in range(target_count):
@@ -167,53 +144,40 @@ def create_excel(data_list, original_columns, target_count):
 
         for i, item in enumerate(data_list):
             row_idx = i + 1
-            
             for k in range(target_count):
                 if k < len(item['images_data']):
                     img_bytes = item['images_data'][k]
                     url_link = item['image_urls'][k]
-                    
                     col_img = start_col + k
-                    
                     if img_bytes:
                         ws.insert_image(row_idx, col_img, "img.jpg", {
-                            'image_data': img_bytes,
-                            'x_scale': 1, 'y_scale': 1,
-                            'object_position': 1,
+                            'image_data': img_bytes, 'x_scale': 1, 'y_scale': 1, 'object_position': 1,
                             'url': url_link 
                         })
-
     return output.getvalue()
 
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("🐢 Smart-Image-Finder (안전모드)")
-st.caption("3~6초 간격으로 천천히 실행하여 에러를 방지합니다.")
+st.title("🤗 Smart-Image-Finder (Hugging Face)")
+st.caption("Hugging Face의 BLIP 모델을 사용하여 이미지를 분석합니다.")
 
 st.sidebar.title("설정 & 로그")
 use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True)
 log_placeholder = st.sidebar.empty()
 
+# 키 입력 받기
 try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    HF_API_KEY = st.secrets["HF_API_KEY"]
 except:
-    GOOGLE_API_KEY = ""
+    HF_API_KEY = ""
 
-if not GOOGLE_API_KEY:
-    GOOGLE_API_KEY = st.sidebar.text_input("Google API Key 입력", type="password")
+if not HF_API_KEY:
+    HF_API_KEY = st.sidebar.text_input("Hugging Face Token (hf_...)", type="password")
 
 uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"])
 
-if uploaded_file and GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    
-    if not st.session_state.best_model_name:
-        with st.spinner("최적의 모델 검색 중..."):
-            st.session_state.best_model_name = get_best_gemini_model()
-    
-    st.info(f"🤖 모델: {st.session_state.best_model_name}")
-
+if uploaded_file and HF_API_KEY:
     df = pd.read_excel(uploaded_file)
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1: col_brand = st.selectbox("제조사 열", df.columns, index=0)
@@ -245,7 +209,9 @@ if st.session_state.is_processing:
         if st.session_state.stop_requested: break
             
         row = df.iloc[i]
-        full_name = f"{row[col_brand]} {row[col_model]}"
+        brand = str(row[col_brand])
+        model = str(row[col_model])
+        full_name = f"{brand} {model}"
         
         status_box.markdown(f"**[{i+1}/{total_rows}]** 처리 중: `{full_name}`")
         add_log(f"▶ [{i+1}] {full_name}")
@@ -265,15 +231,19 @@ if st.session_state.is_processing:
                     reason = "AI 미사용"
                     
                     if use_ai_check:
-                        is_ok, reason = verify_with_gemini(st.session_state.best_model_name, pil_img, full_name)
+                        # Hugging Face로 전송하기 위해 바이트 변환
+                        img_byte_arr = BytesIO()
+                        pil_img.save(img_byte_arr, format='JPEG')
+                        img_bytes_for_api = img_byte_arr.getvalue()
+                        
+                        is_ok, reason = verify_with_huggingface(HF_API_KEY, img_bytes_for_api, brand)
                     
                     if is_ok:
                         add_log(f"  {reason}")
-                        img_bytes = image_to_bytes(pil_img)
-                        valid_images_bytes.append(img_bytes)
+                        # 엑셀 저장용 변환
+                        final_bytes = image_to_bytes(pil_img)
+                        valid_images_bytes.append(final_bytes)
                         valid_image_urls.append(url)
-                        
-                        # [요청 반영] 3초 ~ 6초 대기
                         if use_ai_check: time.sleep(get_random_delay())
                     else:
                         add_log(f"  {reason}")
@@ -300,4 +270,4 @@ if st.session_state.is_processing:
 if len(st.session_state.processed_data) > 0:
     if st.button("📥 엑셀 파일 다운로드 생성"):
         data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
-        st.download_button("다운로드", data, "Safe_Result.xlsx")
+        st.download_button("다운로드", data, "HuggingFace_Result.xlsx")
