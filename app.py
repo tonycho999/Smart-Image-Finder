@@ -41,10 +41,9 @@ except (FileNotFoundError, KeyError):
 st.title("🔎 Smart-Image-Finder")
 
 # ---------------------------------------------------------
-# 4. 기능 함수 정의 (검색 & AI)
+# 4. 기능 함수 정의
 # ---------------------------------------------------------
 def load_google_sheet(url):
-    """구글 시트 읽기"""
     if "docs.google.com/spreadsheets" not in url:
         return None
     new_url = re.sub(r"/edit.*", "/export?format=xlsx", url)
@@ -53,21 +52,19 @@ def load_google_sheet(url):
     except: return None
 
 def search_duckduckgo_images(query, num=10):
-    """이미지 검색 (DuckDuckGo)"""
     try:
         results = DDGS().images(keywords=query, region="wt-wt", safesearch="off", max_results=num)
         return [r['image'] for r in results]
     except: return []
 
 def verify_image_with_groq(image_url, product_name, api_key):
-    """AI 이미지 검수"""
     if not api_key: return False
     try:
         client = Groq(api_key=api_key)
         prompt = f"""
         Does this image show the product '{product_name}'?
-        Answer YES only if it clearly shows the product itself.
-        Answer NO if it is a logo, text, diagram, or completely wrong object.
+        Answer YES only if it clearly shows the product.
+        Answer NO if it is a logo, text, or completely wrong object.
         Answer only YES or NO.
         """
         completion = client.chat.completions.create(
@@ -79,159 +76,147 @@ def verify_image_with_groq(image_url, product_name, api_key):
     except: return False
 
 # ---------------------------------------------------------
-# 5. 엑셀 생성 함수 (이미지 삽입 기능 포함) ⭐ 중요
+# 5. 엑셀 생성 함수 (수정됨: 차단 방지 & 데이터 처리 강화)
 # ---------------------------------------------------------
 def generate_excel_with_images(df, image_cols):
-    """데이터프레임을 받아 이미지를 실제 셀에 삽입하여 엑셀 바이너리를 반환"""
     output = BytesIO()
     
-    # Pandas ExcelWriter를 xlsxwriter 엔진으로 생성
+    # XlsxWriter 엔진 사용
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
         
         workbook = writer.book
         worksheet = writer.sheets['Sheet1']
         
-        # 서식 설정 (텍스트 줄바꿈, 수직 가운데 정렬)
-        text_format = workbook.add_format({'text_wrap': True, 'valign': 'vcenter'})
+        # 행 높이 설정 (100 픽셀)
+        worksheet.set_default_row(100)
         
-        # 전체 행 높이 설정 (이미지가 들어갈 공간 확보, 약 100픽셀)
-        worksheet.set_default_row(80) 
-        
-        # 전체 열에 서식 적용 (A열부터 끝까지)
-        worksheet.set_column(0, len(df.columns) - 1, 20, text_format)
+        # 텍스트 줄바꿈 서식
+        text_fmt = workbook.add_format({'text_wrap': True, 'valign': 'vcenter', 'align': 'center'})
+        worksheet.set_column(0, len(df.columns) - 1, 20, text_fmt)
 
-        # 이미지 컬럼들 처리
-        # 데이터프레임의 컬럼 이름을 보고 엑셀의 몇 번째 열인지 찾음
-        col_indices = [df.columns.get_loc(c) for c in image_cols]
+        # 이미지 다운로드용 헤더 (봇 차단 방지)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
 
+        # 데이터 순회하며 이미지 삽입
         for row_idx, row in df.iterrows():
-            # 엑셀은 헤더가 0행이므로 데이터는 1행부터 시작
             excel_row = row_idx + 1
             
             for col_name in image_cols:
                 url = row[col_name]
+                if not isinstance(url, str) or not url.startswith("http"):
+                    continue
+                    
                 col_idx = df.columns.get_loc(col_name)
                 
-                # URL이 있고 "검색실패"가 아니면 이미지 다운로드 시도
-                if url and str(url).startswith("http"):
-                    try:
-                        response = requests.get(url, timeout=3)
-                        if response.status_code == 200:
-                            img_data = BytesIO(response.content)
-                            
-                            # Pillow로 이미지 리사이징 (용량 최적화 & 셀 맞춤)
-                            img = PILImage.open(img_data)
-                            img.thumbnail((120, 120)) # 썸네일 크기
-                            
-                            # 메모리에 저장된 이미지를 다시 바이트로 변환
-                            img_byte_arr = BytesIO()
-                            img_format = img.format if img.format else 'JPEG'
-                            img.save(img_byte_arr, format=img_format)
-                            
-                            # 엑셀에 삽입
-                            worksheet.insert_image(excel_row, col_idx, url, {
-                                'image_data': img_byte_arr,
-                                'x_scale': 1, 'y_scale': 1,
-                                'object_position': 1 # 셀 내 이동/크기변함 설정
-                            })
-                            
-                            # 이미지 들어간 열 너비 조금 넓게
-                            worksheet.set_column(col_idx, col_idx, 18)
-                    except:
-                        pass # 이미지 다운로드 실패 시 그냥 URL 텍스트만 유지
+                try:
+                    # 1. 이미지 다운로드 (타임아웃 5초)
+                    response = requests.get(url, headers=headers, timeout=5)
+                    response.raise_for_status()
+                    
+                    # 2. 이미지 데이터 가공
+                    img_data = BytesIO(response.content)
+                    img = PILImage.open(img_data)
+                    
+                    # 이미지 모드 변환 (P모드 등은 JPG 저장 시 에러 가능성 있음 -> RGB 변환)
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                        
+                    # 썸네일 리사이징 (메모리 절약)
+                    img.thumbnail((120, 120))
+                    
+                    # 3. 바이트 스트림으로 다시 저장
+                    img_byte_arr = BytesIO()
+                    img.save(img_byte_arr, format="JPEG")
+                    img_byte_arr.seek(0) # [중요] 포인터 초기화
+                    
+                    # 4. 엑셀에 삽입
+                    worksheet.insert_image(excel_row, col_idx, "image.jpg", {
+                        'image_data': img_byte_arr,
+                        'x_scale': 1, 'y_scale': 1,
+                        'object_position': 1
+                    })
+                except Exception as e:
+                    # 실패 시 URL 텍스트만 남김 (디버깅용: print(e))
+                    pass
 
     return output.getvalue()
 
 # ---------------------------------------------------------
-# 6. 입력 UI
+# 6. 메인 로직
 # ---------------------------------------------------------
 tab1, tab2 = st.tabs(["📂 엑셀 파일 업로드", "🔗 구글 스프레드시트 링크"])
-
 df = None
 file_name = "Result.xlsx"
 
 with tab1:
-    uploaded_file = st.file_uploader("엑셀 파일(.xlsx)을 업로드하세요", type=["xlsx", "xls"])
-    if uploaded_file:
-        try:
-            df = pd.read_excel(uploaded_file)
-            st.success(f"✅ 파일 로드: {uploaded_file.name}")
-            file_name = f"Result_{uploaded_file.name}"
+    uploaded = st.file_uploader("엑셀 파일(.xlsx)", type=["xlsx", "xls"])
+    if uploaded:
+        try: 
+            df = pd.read_excel(uploaded)
+            file_name = f"Result_{uploaded.name}"
+            st.success("✅ 파일 로드 성공")
         except: st.error("파일 오류")
 
 with tab2:
-    sheet_url = st.text_input("구글 스프레드시트 URL")
-    st.caption("결과물은 엑셀 파일로 다운로드됩니다. (이미지 포함)")
-    if sheet_url:
-        df = load_google_sheet(sheet_url)
-        if df is not None:
-            st.success("✅ 시트 로드 성공")
+    url = st.text_input("구글 스프레드시트 URL")
+    if url:
+        df = load_google_sheet(url)
+        if df: 
             file_name = "Result_GoogleSheet.xlsx"
+            st.success("✅ 시트 로드 성공")
         else: st.warning("❌ 시트 로드 실패")
 
-# ---------------------------------------------------------
-# 7. 실행 로직
-# ---------------------------------------------------------
 if df is not None:
     st.markdown("---")
-    
     c1, c2, c3 = st.columns([2, 2, 1])
     cols = df.columns.tolist()
-    
     with c1: col_brand = st.selectbox("제조사 열", cols, index=0)
-    with c2: col_model = st.selectbox("품번 열", cols, index=1 if len(cols) > 1 else 0)
-    with c3: 
-        target_count = st.number_input("필요한 사진 수", min_value=1, max_value=5, value=1)
+    with c2: col_model = st.selectbox("품번 열", cols, index=1 if len(cols)>1 else 0)
+    with c3: target_count = st.number_input("필요한 사진 수", 1, 5, 1)
 
-    if st.button("🚀 이미지 찾기 시작 (이미지 엑셀 삽입)", type="primary"):
-        if not GROQ_API_KEY:
-            st.error("⚠️ Groq API 키 필요"); st.stop()
+    if st.button("🚀 이미지 찾기 & 엑셀 삽입", type="primary"):
+        if not GROQ_API_KEY: st.error("API 키 필요"); st.stop()
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
+        bar = st.progress(0)
+        status = st.empty()
         all_results = []
         total = len(df)
         
-        # --- 검색 루프 ---
-        for index, row in df.iterrows():
+        # 1. 검색 단계
+        for i, row in df.iterrows():
             brand = str(row[col_brand])
             model = str(row[col_model])
-            query = f"{brand} {model} product"
+            status.text(f"({i+1}/{total}) 검색 중: {brand} {model}")
             
-            status_text.text(f"({index+1}/{total}) 검색 및 다운로드 준비 중: {brand} {model}")
-            
-            candidates = search_duckduckgo_images(query, num=15)
-            found_images = []
+            candidates = search_duckduckgo_images(f"{brand} {model} product", num=15)
+            found = []
             
             if candidates:
                 for img in candidates:
-                    if len(found_images) >= target_count: break
+                    if len(found) >= target_count: break
                     if verify_image_with_groq(img, f"{brand} {model}", GROQ_API_KEY):
-                        found_images.append(img)
-                        time.sleep(0.3) 
-            
-            all_results.append(found_images)
-            progress_bar.progress((index + 1) / total)
-            
-        # --- 결과 정리 ---
-        image_columns = []
-        for i in range(target_count):
-            col_name = f"이미지_{i+1}"
-            image_columns.append(col_name)
-            df[col_name] = [res[i] if i < len(res) else "" for res in all_results]
-
-        df["검수_상태"] = [f"{len(res)}장 찾음" for res in all_results]
+                        found.append(img)
+                        time.sleep(0.3)
+            all_results.append(found)
+            bar.progress((i+1)/total)
         
-        st.success("🎉 검색 완료! 엑셀 파일 생성 중... (이미지 삽입에 시간이 조금 걸립니다)")
+        # 2. 결과 정리
+        img_cols = []
+        for k in range(target_count):
+            c_name = f"이미지_{k+1}"
+            img_cols.append(c_name)
+            df[c_name] = [res[k] if k < len(res) else "" for res in all_results]
         
-        # --- 엑셀 생성 (이미지 삽입) ---
-        excel_data = generate_excel_with_images(df, image_columns)
+        df["검수결과"] = [f"{len(r)}장 성공" for r in all_results]
         
-        st.download_button(
-            label="📥 이미지가 포함된 엑셀 다운로드",
-            data=excel_data,
-            file_name=file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # 3. 엑셀 생성 단계 (시간 소요됨)
+        status.text("⏳ 엑셀 파일에 이미지를 삽입하는 중입니다... (잠시만 기다려주세요)")
+        try:
+            excel_data = generate_excel_with_images(df, img_cols)
+            st.success("🎉 완료되었습니다! 아래 버튼을 눌러 다운로드하세요.")
+            st.download_button("📥 이미지 포함 엑셀 다운로드", excel_data, file_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(f"엑셀 생성 중 오류 발생: {e}")
