@@ -4,3 +4,4 @@ requests
 groq
 openpyxl
 xlsxwriter
+duckduckgo-search
