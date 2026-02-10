@@ -14,7 +14,7 @@ from duckduckgo_search import DDGS
 # 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Smart-Image-Finder (Auto-Model)",
+    page_title="Smart-Image-Finder (Pro)",
     page_icon="⚡",
     layout="wide"
 )
@@ -52,43 +52,30 @@ def add_log(msg):
 # 3. 핵심 함수
 # ---------------------------------------------------------
 def get_random_delay():
-    """1000ms ~ 3000ms 사이의 랜덤한 실수 반환 (예: 2.304초)"""
-    return random.uniform(1.0, 3.0)
+    # 봇 탐지 회피를 위한 랜덤 대기 (1.2초 ~ 2.5초)
+    return random.uniform(1.2, 2.5)
 
 def get_best_gemini_model():
-    """
-    [핵심] 사용 가능한 모델을 검색하고 Pro는 제외, 최신 Flash 우선 선택
-    """
+    """모델 자동 선정 (Flash 우선)"""
     try:
-        # 모델 목록 가져오기
         models = list(genai.list_models())
-        
-        # 조건: 'generateContent' 지원 + 'vision' 기능(보통 gemini 시작 모델)
-        # 필터: 'pro' 제외, 'gemini' 포함
         candidates = []
         for m in models:
             name = m.name.lower()
             if 'gemini' in name and 'pro' not in name and 'generateContent' in m.supported_generation_methods:
                 candidates.append(m.name)
         
-        # 정렬 우선순위: 숫자가 높은 것(최신) -> flash가 있는 것
-        # 예: gemini-2.0-flash-exp > gemini-1.5-flash > gemini-1.5-flash-8b
-        candidates.sort(key=lambda x: (
-            '2.0' in x,      # 2.0 버전 우선
-            'flash' in x,    # flash 우선
-            x                # 이름순
-        ), reverse=True)
+        # 최신(숫자 큼) -> Flash 포함 순으로 정렬
+        candidates.sort(key=lambda x: ('2.0' in x, 'flash' in x, x), reverse=True)
         
-        if candidates:
-            return candidates[0] # 가장 좋은 것 선택
-        return 'gemini-1.5-flash' # 없으면 기본값
-        
-    except Exception as e:
-        return 'gemini-1.5-flash' # 에러나면 안전한 기본값
+        if candidates: return candidates[0]
+        return 'gemini-1.5-flash'
+    except:
+        return 'gemini-1.5-flash'
 
 def safe_download_image(url):
-    """이미지 다운로드 (10초 제한)"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    """이미지 다운로드 (타임아웃 10초)"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     try:
         response = requests.get(url, headers=headers, timeout=10) 
         response.raise_for_status()
@@ -99,88 +86,132 @@ def safe_download_image(url):
         return None
 
 def image_to_bytes(img):
-    img.thumbnail((150, 150))
+    """엑셀용 이미지 바이트 변환 (비율 유지 리사이징)"""
+    # 엑셀 셀 크기(약 130x130)에 맞게 썸네일 생성
+    img.thumbnail((130, 130))
     img_byte_arr = BytesIO()
     img.save(img_byte_arr, format="JPEG")
     img_byte_arr.seek(0)
     return img_byte_arr
 
 def search_with_retry(query, max_retries=3):
-    """검색 실패 시 2초 -> 4초 -> 6초 대기"""
+    """검색 재시도 로직"""
     for attempt in range(max_retries):
         try:
-            results = DDGS().images(keywords=query, region="wt-wt", safesearch="off", max_results=15)
+            # 검색어에 'image'를 추가하거나 빼면서 시도
+            q = query if attempt == 0 else query.replace(" product", "")
+            results = DDGS().images(keywords=q, region="wt-wt", safesearch="off", max_results=20)
             return [r['image'] for r in results if 'image' in r]
         except: 
-            wait_time = 2 * (attempt + 1) # 2, 4, 6
-            time.sleep(wait_time)
+            time.sleep(2)
     return []
 
 def verify_with_gemini(model_name, img, product_name):
-    """AI 검수 (10초 제한 로직 포함)"""
+    """
+    [기준 대폭 완화]
+    제품 사진처럼 보이면 무조건 YES를 하도록 유도
+    """
     try:
         model = genai.GenerativeModel(model_name)
         
+        # 프롬프트: '제품'이면 무조건 통과시켜라.
         prompt = f"""
-        Does this image show the product '{product_name}'?
-        Answer YES only if it clearly shows the product.
-        Answer NO if it is a diagram, logo, text only, or completely different object.
+        Does this image look like a commercial product, item, or device related to '{product_name}'?
+        
+        Rules:
+        1. Answer YES if it shows ANY product.
+        2. Answer YES even if it has some text or white background is missing.
+        3. Answer NO only if it is an error message, a blank page, or map.
+        
         Output only one word: YES or NO.
         """
         
-        # [설정] 타임아웃 10초 설정 (request_options 사용 가능 시)
-        # 구글 라이브러리 버전에 따라 다르므로, 기본적으로는 모델 속도에 의존하되
-        # 안전장치로 예외처리를 둠.
         response = model.generate_content(
             [prompt, img],
             generation_config=GenerationConfig(max_output_tokens=10, temperature=0.1),
-            request_options={'timeout': 10} # 10초 제한
+            request_options={'timeout': 10}
         )
         
         answer = response.text.strip().upper()
         
         if "YES" in answer:
-            return True, f"✅ 합격 ({model_name})"
+            return True, f"✅ 합격"
         else:
-            return False, f"⛔ 불합격"
+            return False, f"⛔ AI 거절"
             
     except Exception as e:
-        err_msg = str(e)
-        if "429" in err_msg:
-            return True, "⚠️ 속도제한 (자동통과)"
-        elif "deadline" in err_msg or "timeout" in err_msg:
-            return True, "⚠️ 시간초과 (자동통과)"
-        return True, f"⚠️ 에러 (자동통과)"
+        # 에러나면 그냥 통과시킴 (이미지 확보 우선)
+        return True, "⚠️ 에러(자동통과)"
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
     rows = []
+    
+    # 데이터 프레임 준비
     for item in data_list:
         row_data = item['original_row'].copy()
         row_data['처리결과'] = item['status']
         rows.append(row_data)
     
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name='Result')
+        df_res = pd.DataFrame(rows)
+        df_res.to_excel(writer, index=False, sheet_name='Result')
+        
+        wb = writer.book
         ws = writer.sheets['Result']
+        
+        # 행 높이 설정 (이미지가 들어갈 공간)
         ws.set_default_row(100)
+        
+        # 텍스트 줄바꿈 및 정렬
+        fmt_text = wb.add_format({'text_wrap': True, 'valign': 'vcenter'})
+        ws.set_column(0, len(original_columns), 15, fmt_text)
+
+        # 이미지/링크 삽입
+        # 기존 데이터 컬럼 + 1(처리결과) 다음부터 시작
+        start_col = len(original_columns) + 1
+        
+        # 헤더 쓰기
+        for i in range(target_count):
+            ws.write(0, start_col + (i*2), f"이미지_{i+1}")
+            ws.write(0, start_col + (i*2) + 1, f"링크_{i+1}")
+            # 열 너비 조정 (이미지 칸은 넓게, 링크 칸은 좁게)
+            ws.set_column(start_col + (i*2), start_col + (i*2), 18) # 이미지칸
+            ws.set_column(start_col + (i*2) + 1, start_col + (i*2) + 1, 10, fmt_text) # 링크칸
+
         for i, item in enumerate(data_list):
             row_idx = i + 1
-            for img_idx, img_bytes in enumerate(item['images_data']):
-                if img_idx >= target_count: break
-                col_idx = len(original_columns) + 1 + img_idx
-                if img_bytes:
-                    ws.insert_image(row_idx, col_idx, "img.jpg", {'image_data': img_bytes, 'x_scale': 1, 'y_scale': 1, 'object_position': 1})
+            
+            # 각 이미지별로 반복
+            for k in range(target_count):
+                # k번째 이미지가 있는지 확인
+                if k < len(item['images_data']):
+                    img_bytes = item['images_data'][k]
+                    url_link = item['image_urls'][k]
+                    
+                    # 1. 이미지 삽입
+                    col_img = start_col + (k*2)
+                    if img_bytes:
+                        ws.insert_image(row_idx, col_img, "img.jpg", {
+                            'image_data': img_bytes,
+                            'x_scale': 1, 'y_scale': 1,
+                            'object_position': 1 # 셀과 함께 이동 및 크기 변함
+                        })
+                    
+                    # 2. 링크 삽입 (바로 옆 칸)
+                    col_link = start_col + (k*2) + 1
+                    ws.write_url(row_idx, col_link, url_link, string="[보기]")
+
     return output.getvalue()
 
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("⚡ Smart-Image-Finder (Auto-Model)")
-st.caption("최적의 AI 모델을 자동으로 찾아 실행합니다. (Pro 제외, 최신 Flash 우선)")
+st.title("⚡ Smart-Image-Finder (Pro)")
+st.caption("AI 검수 기준 완화 & 엑셀 링크 기능 추가")
 
 st.sidebar.title("설정 & 로그")
-use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True)
+use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True, help="체크 해제하면 무조건 다운로드합니다.")
 log_placeholder = st.sidebar.empty()
 
 try:
@@ -196,12 +227,11 @@ uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"]
 if uploaded_file and GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    # [모델 자동 선정]
     if not st.session_state.best_model_name:
-        with st.spinner("최적의 모델을 검색 중입니다... (Pro 제외)"):
+        with st.spinner("최적의 모델 검색 중..."):
             st.session_state.best_model_name = get_best_gemini_model()
     
-    st.info(f"🤖 현재 선택된 모델: **{st.session_state.best_model_name}**")
+    st.info(f"🤖 모델: {st.session_state.best_model_name}")
 
     df = pd.read_excel(uploaded_file)
     c1, c2, c3 = st.columns([2, 2, 1])
@@ -240,32 +270,30 @@ if st.session_state.is_processing:
         add_log(f"▶ [{i+1}] {full_name}")
         
         candidates = search_with_retry(f"{full_name} product")
-        valid_images_bytes = [] 
+        valid_images_bytes = []
+        valid_image_urls = [] # 링크 저장용
         
         if candidates:
             for url in candidates[:15]:
                 if len(valid_images_bytes) >= target_count: break
                 
-                # 1. 이미지 다운로드 (10초 제한)
                 pil_img = safe_download_image(url)
                 
                 if pil_img:
                     is_ok = True
                     reason = "AI 미사용"
                     
-                    # 2. AI 검수 (최대 10초)
                     if use_ai_check:
                         is_ok, reason = verify_with_gemini(st.session_state.best_model_name, pil_img, full_name)
                     
                     if is_ok:
                         add_log(f"  {reason}")
                         img_bytes = image_to_bytes(pil_img)
-                        valid_images_bytes.append(img_bytes)
                         
-                        # [중요] 검수 완료 후 랜덤 대기 (1000ms ~ 3000ms)
-                        if use_ai_check: 
-                            delay = get_random_delay()
-                            time.sleep(delay)
+                        valid_images_bytes.append(img_bytes)
+                        valid_image_urls.append(url) # URL도 같이 저장
+                        
+                        if use_ai_check: time.sleep(get_random_delay())
                     else:
                         add_log(f"  {reason}")
                 else:
@@ -277,6 +305,7 @@ if st.session_state.is_processing:
         st.session_state.processed_data.append({
             'original_row': row.to_dict(),
             'images_data': valid_images_bytes,
+            'image_urls': valid_image_urls,
             'status': msg
         })
         
