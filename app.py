@@ -14,8 +14,8 @@ from duckduckgo_search import DDGS
 # 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Smart-Image-Finder (Final)",
-    page_icon="⚡",
+    page_title="Smart-Image-Finder (Slow & Safe)",
+    page_icon="🐢",
     layout="wide"
 )
 
@@ -52,7 +52,9 @@ def add_log(msg):
 # 3. 핵심 함수
 # ---------------------------------------------------------
 def get_random_delay():
-    return random.uniform(1.2, 2.5)
+    # [수정됨] 요청하신 대로 3초 ~ 6초 사이 랜덤 대기
+    # 이 정도면 구글 무료 제한(RPM 15)을 절대 넘지 않습니다.
+    return random.uniform(3.0, 6.0)
 
 def get_best_gemini_model():
     """모델 자동 선정"""
@@ -100,21 +102,17 @@ def search_with_retry(query, max_retries=3):
     return []
 
 def verify_with_gemini(model_name, img, product_name):
-    """
-    [수정됨] 이미지 전송 방식 변경 (오류 해결용)
-    """
+    """Gemini AI 검수"""
     try:
         model = genai.GenerativeModel(model_name)
         
         prompt = f"""
         Does this image look like a product related to '{product_name}'?
-        Answer YES if it shows ANY product (shoes, clothes, box, etc).
+        Answer YES if it shows ANY product.
         Answer NO only if it is an error page, text only, or map.
         Output only: YES or NO.
         """
         
-        # [핵심 수정] 이미지를 바로 보내지 않고, 바이트 데이터로 변환해서 전송 (더 안정적)
-        # PIL 이미지를 메모리상의 바이트로 변환
         img_byte_arr = BytesIO()
         img.save(img_byte_arr, format='JPEG')
         img_blob = {'mime_type': 'image/jpeg', 'data': img_byte_arr.getvalue()}
@@ -134,14 +132,12 @@ def verify_with_gemini(model_name, img, product_name):
             
     except Exception as e:
         err_msg = str(e)
-        # 로그에 정확한 에러 메시지 출력 (디버깅용)
         if "429" in err_msg:
             return True, "⚠️ 속도제한(자동통과)"
         elif "API key not valid" in err_msg:
             return True, "⚠️ 키 오류(자동통과)"
         else:
-            # 에러 내용을 짧게 줄여서 로그에 표시
-            return True, f"⚠️ 에러({err_msg[:15]}...)"
+            return True, f"⚠️ 에러({err_msg[:10]}...)"
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
@@ -180,12 +176,11 @@ def create_excel(data_list, original_columns, target_count):
                     col_img = start_col + k
                     
                     if img_bytes:
-                        # [핵심 수정] url 파라미터 추가 -> 사진 클릭 시 이동
                         ws.insert_image(row_idx, col_img, "img.jpg", {
                             'image_data': img_bytes,
                             'x_scale': 1, 'y_scale': 1,
                             'object_position': 1,
-                            'url': url_link  # 여기가 핵심: 이미지를 클릭하면 이 주소로 감
+                            'url': url_link 
                         })
 
     return output.getvalue()
@@ -193,8 +188,8 @@ def create_excel(data_list, original_columns, target_count):
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("⚡ Smart-Image-Finder (Clickable)")
-st.caption("사진을 클릭하면 원본 사이트로 이동합니다.")
+st.title("🐢 Smart-Image-Finder (안전모드)")
+st.caption("3~6초 간격으로 천천히 실행하여 에러를 방지합니다.")
 
 st.sidebar.title("설정 & 로그")
 use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True)
@@ -275,10 +270,10 @@ if st.session_state.is_processing:
                     if is_ok:
                         add_log(f"  {reason}")
                         img_bytes = image_to_bytes(pil_img)
-                        
                         valid_images_bytes.append(img_bytes)
                         valid_image_urls.append(url)
                         
+                        # [요청 반영] 3초 ~ 6초 대기
                         if use_ai_check: time.sleep(get_random_delay())
                     else:
                         add_log(f"  {reason}")
@@ -305,4 +300,4 @@ if st.session_state.is_processing:
 if len(st.session_state.processed_data) > 0:
     if st.button("📥 엑셀 파일 다운로드 생성"):
         data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
-        st.download_button("다운로드", data, "Clickable_Result.xlsx")
+        st.download_button("다운로드", data, "Safe_Result.xlsx")
