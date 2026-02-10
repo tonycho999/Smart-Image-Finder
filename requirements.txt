@@ -1,8 +1,8 @@
 streamlit
 pandas
 requests
-groq
+google-generativeai
+duckduckgo-search
 openpyxl
 xlsxwriter
-duckduckgo-search
 Pillow
