@@ -11,62 +11,36 @@ from duckduckgo_search import DDGS
 # ---------------------------------------------------------
 # 1. 페이지 설정
 # ---------------------------------------------------------
-st.set_page_config(
-    page_title="Smart-Image-Finder (HuggingFace)",
-    page_icon="🤗",
-    layout="wide"
-)
-
-st.markdown("""
-<style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .log-box {
-        height: 300px;
-        overflow-y: scroll;
-        background-color: #f0f2f6;
-        border: 1px solid #d6d6d6;
-        padding: 10px;
-        font-family: monospace;
-        font-size: 11px;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Smart-Image-Finder (Debug)", page_icon="🔧", layout="wide")
 
 # ---------------------------------------------------------
-# 2. 상태 관리
+# 2. API 키 불러오기 (디버깅 추가)
 # ---------------------------------------------------------
-if 'processed_data' not in st.session_state: st.session_state.processed_data = []
-if 'is_processing' not in st.session_state: st.session_state.is_processing = False
-if 'stop_requested' not in st.session_state: st.session_state.stop_requested = False
-if 'logs' not in st.session_state: st.session_state.logs = []
-
-def add_log(msg):
-    st.session_state.logs.append(msg)
+try:
+    HF_API_KEY = st.secrets["HF_API_KEY"]
+    st.sidebar.success("✅ Secrets에서 키를 찾았습니다!")
+except Exception as e:
+    st.sidebar.warning("⚠️ Secrets에서 키를 못 찾았습니다. 아래에 입력해주세요.")
+    st.sidebar.error(f"에러 내용: {e}") # 여기서 왜 못 읽었는지 알려줌
+    HF_API_KEY = st.sidebar.text_input("Hugging Face Token (hf_...)", type="password")
 
 # ---------------------------------------------------------
-# 3. 핵심 함수 (Hugging Face API)
+# 3. 핵심 함수
 # ---------------------------------------------------------
 def get_random_delay():
-    # Hugging Face 무료 API도 너무 빠르면 503 에러가 뜹니다.
-    # 2~3초 정도 쉬어주는 게 가장 안전합니다.
     return random.uniform(2.0, 3.0)
 
 def safe_download_image(url):
-    """이미지 다운로드"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        response = requests.get(url, headers=headers, timeout=10) 
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         img = PILImage.open(BytesIO(response.content))
         if img.mode in ("RGBA", "P"): img = img.convert("RGB")
         return img
-    except:
-        return None
+    except: return None
 
 def image_to_bytes(img):
-    """엑셀 저장용 이미지 바이트 변환"""
     img.thumbnail((130, 130))
     img_byte_arr = BytesIO()
     img.save(img_byte_arr, format="JPEG")
@@ -77,71 +51,55 @@ def search_with_retry(query, max_retries=3):
     for attempt in range(max_retries):
         try:
             q = query if attempt == 0 else query.replace(" product", "")
-            results = DDGS().images(keywords=q, region="wt-wt", safesearch="off", max_results=20)
+            results = DDGS().images(keywords=q, region="wt-wt", safesearch="off", max_results=15)
             return [r['image'] for r in results if 'image' in r]
-        except: 
-            time.sleep(2)
+        except: time.sleep(2)
     return []
 
 def verify_with_huggingface(api_key, img_bytes, brand_name):
-    """
-    Hugging Face의 BLIP 모델(이미지 설명)을 사용합니다.
-    """
+    # BLIP 모델 사용 (이미지 설명)
     API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
     headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
         response = requests.post(API_URL, headers=headers, data=img_bytes, timeout=10)
         
-        # 모델 로딩 중이면(503 에러) 잠시 대기 후 재시도
+        # [에러 진단]
         if response.status_code == 503:
-            return True, "⚠️ 모델 로딩중(자동통과)"
-            
+            return True, "⚠️ 모델 로딩중(503/자동통과)" # 무료라서 모델 켜지는 중
+        elif response.status_code == 401:
+            return True, "⚠️ 키 오류(401/자동통과)" # 키가 틀림
+        elif response.status_code != 200:
+            return True, f"⚠️ API에러({response.status_code})"
+
         result = response.json()
         
-        # 결과 예시: [{'generated_text': 'a pair of nike shoes...'}]
         if isinstance(result, list) and 'generated_text' in result[0]:
             caption = result[0]['generated_text'].lower()
-            
-            # 브랜드 이름이 설명에 포함되어 있는지 확인
-            # (예: Nike 제품인데 설명에 'nike'가 있으면 합격)
-            brand_clean = brand_name.lower().split()[0] # 첫 단어만 비교 (Nike, Adidas 등)
-            
-            if brand_clean in caption or "shoes" in caption or "product" in caption:
-                 return True, f"✅ 합격 ({caption})"
+            if brand_name.lower().split()[0] in caption or "shoes" in caption or "product" in caption:
+                 return True, f"✅ 합격"
             else:
-                 # 브랜드도 없고 신발도 아니면? 그래도 일단 통과시킴 (이미지 확보 우선)
-                 return True, f"⚠️ 애매함 ({caption})"
+                 return True, f"⚠️ 애매함({caption[:10]}..)"
         
-        return True, "⚠️ 분석불가(자동통과)"
+        return True, "⚠️ 분석불가"
 
     except Exception as e:
-        return True, f"⚠️ 에러(자동통과)"
+        return True, f"⚠️ 시스템에러({str(e)})"
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
     rows = []
-    
     for item in data_list:
         row_data = item['original_row'].copy()
         row_data['처리결과'] = item['status']
         rows.append(row_data)
     
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_res = pd.DataFrame(rows)
-        df_res.to_excel(writer, index=False, sheet_name='Result')
-        
-        wb = writer.book
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name='Result')
         ws = writer.sheets['Result']
         ws.set_default_row(100)
-        fmt_text = wb.add_format({'text_wrap': True, 'valign': 'vcenter'})
-        ws.set_column(0, len(original_columns), 15, fmt_text)
         start_col = len(original_columns) + 1
         
-        for i in range(target_count):
-            ws.write(0, start_col + i, f"이미지_{i+1}")
-            ws.set_column(start_col + i, start_col + i, 18) 
-
         for i, item in enumerate(data_list):
             row_idx = i + 1
             for k in range(target_count):
@@ -159,21 +117,10 @@ def create_excel(data_list, original_columns, target_count):
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("🤗 Smart-Image-Finder (Hugging Face)")
-st.caption("Hugging Face의 BLIP 모델을 사용하여 이미지를 분석합니다.")
+st.title("🔧 Smart-Image-Finder (Debug Mode)")
 
-st.sidebar.title("설정 & 로그")
-use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True)
-log_placeholder = st.sidebar.empty()
-
-# 키 입력 받기
-try:
-    HF_API_KEY = st.secrets["HF_API_KEY"]
-except:
-    HF_API_KEY = ""
-
-if not HF_API_KEY:
-    HF_API_KEY = st.sidebar.text_input("Hugging Face Token (hf_...)", type="password")
+if 'processed_data' not in st.session_state: st.session_state.processed_data = []
+if 'is_processing' not in st.session_state: st.session_state.is_processing = False
 
 uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"])
 
@@ -185,89 +132,51 @@ if uploaded_file and HF_API_KEY:
     with c3: target_count = st.number_input("필요 사진 수", 1, 5, 1)
 
     if st.button("🚀 작업 시작"):
-        st.session_state.logs = []
         st.session_state.processed_data = [] 
         st.session_state.is_processing = True
-        st.session_state.stop_requested = False
         st.rerun()
 
-# ---------------------------------------------------------
-# 5. 실행 로직
-# ---------------------------------------------------------
 if st.session_state.is_processing:
-    
-    if st.button("🛑 중단하고 저장하기"):
-        st.session_state.stop_requested = True
-    
     progress_bar = st.progress(0)
     status_box = st.empty()
     
-    start_idx = len(st.session_state.processed_data)
-    total_rows = len(df)
-    
-    for i in range(start_idx, total_rows):
-        if st.session_state.stop_requested: break
-            
-        row = df.iloc[i]
+    for i, row in df.iterrows():
         brand = str(row[col_brand])
         model = str(row[col_model])
-        full_name = f"{brand} {model}"
+        status_box.text(f"처리 중: {brand} {model}")
         
-        status_box.markdown(f"**[{i+1}/{total_rows}]** 처리 중: `{full_name}`")
-        add_log(f"▶ [{i+1}] {full_name}")
-        
-        candidates = search_with_retry(f"{full_name} product")
-        valid_images_bytes = []
-        valid_image_urls = [] 
+        candidates = search_with_retry(f"{brand} {model} product")
+        valid_bytes = []
+        valid_urls = []
         
         if candidates:
             for url in candidates[:15]:
-                if len(valid_images_bytes) >= target_count: break
-                
+                if len(valid_bytes) >= target_count: break
                 pil_img = safe_download_image(url)
-                
                 if pil_img:
-                    is_ok = True
-                    reason = "AI 미사용"
+                    # HuggingFace 전송용 변환
+                    buf = BytesIO()
+                    pil_img.save(buf, format='JPEG')
                     
-                    if use_ai_check:
-                        # Hugging Face로 전송하기 위해 바이트 변환
-                        img_byte_arr = BytesIO()
-                        pil_img.save(img_byte_arr, format='JPEG')
-                        img_bytes_for_api = img_byte_arr.getvalue()
-                        
-                        is_ok, reason = verify_with_huggingface(HF_API_KEY, img_bytes_for_api, brand)
+                    is_ok, reason = verify_with_huggingface(HF_API_KEY, buf.getvalue(), brand)
                     
-                    if is_ok:
-                        add_log(f"  {reason}")
-                        # 엑셀 저장용 변환
-                        final_bytes = image_to_bytes(pil_img)
-                        valid_images_bytes.append(final_bytes)
-                        valid_image_urls.append(url)
-                        if use_ai_check: time.sleep(get_random_delay())
-                    else:
-                        add_log(f"  {reason}")
-                else:
-                    pass 
+                    # 에러나도 저장 (진단용)
+                    final_bytes = image_to_bytes(pil_img)
+                    valid_bytes.append(final_bytes)
+                    valid_urls.append(url)
+                    time.sleep(get_random_delay())
 
-        msg = f"{len(valid_images_bytes)}장 확보"
-        add_log(f"  🏁 결과: {msg}")
-            
         st.session_state.processed_data.append({
             'original_row': row.to_dict(),
-            'images_data': valid_images_bytes,
-            'image_urls': valid_image_urls,
-            'status': msg
+            'images_data': valid_bytes,
+            'image_urls': valid_urls,
+            'status': f"{len(valid_bytes)}장"
         })
-        
-        log_text = "\n".join(st.session_state.logs[-30:])
-        log_placeholder.code(log_text)
-        progress_bar.progress((i + 1) / total_rows)
+        progress_bar.progress((i + 1) / len(df))
     
     st.session_state.is_processing = False
-    st.success("작업 완료!")
+    st.success("완료!")
 
 if len(st.session_state.processed_data) > 0:
-    if st.button("📥 엑셀 파일 다운로드 생성"):
-        data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
-        st.download_button("다운로드", data, "HuggingFace_Result.xlsx")
+    data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
+    st.download_button("다운로드", data, "Debug_Result.xlsx")
