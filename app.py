@@ -10,11 +10,11 @@ from groq import Groq
 from duckduckgo_search import DDGS
 
 # ---------------------------------------------------------
-# 1. 페이지 설정 & 스타일
+# 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Smart-Image-Finder (Auto-Update)",
-    page_icon="🤖",
+    page_title="Smart-Image-Finder (Emergency)",
+    page_icon="🚑",
     layout="wide"
 )
 
@@ -24,129 +24,103 @@ st.markdown("""
     footer {visibility: hidden;}
     header {visibility: hidden;}
     .log-box {
-        height: 200px;
+        height: 300px;
         overflow-y: scroll;
         background-color: #f0f2f6;
         border: 1px solid #d6d6d6;
         padding: 10px;
         font-family: monospace;
-        font-size: 12px;
+        font-size: 11px;
+        line-height: 1.4;
     }
+    .error-msg { color: red; }
+    .success-msg { color: green; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # 2. 상태 관리
 # ---------------------------------------------------------
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = []
-if 'is_processing' not in st.session_state:
-    st.session_state.is_processing = False
-if 'stop_requested' not in st.session_state:
-    st.session_state.stop_requested = False
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
-if 'available_models' not in st.session_state:
-    st.session_state.available_models = []
+if 'processed_data' not in st.session_state: st.session_state.processed_data = []
+if 'is_processing' not in st.session_state: st.session_state.is_processing = False
+if 'stop_requested' not in st.session_state: st.session_state.stop_requested = False
+if 'logs' not in st.session_state: st.session_state.logs = []
 
 def add_log(msg):
     st.session_state.logs.append(msg)
 
 # ---------------------------------------------------------
-# 3. 핵심 기능 함수들
+# 3. 핵심 함수 (Llava 추가됨)
 # ---------------------------------------------------------
-
 def get_random_delay():
-    """1.0초에서 3.0초 사이의 랜덤 대기"""
     return random.uniform(1.0, 3.0)
 
 def safe_download_image(url):
-    """이미지 다운로드 (10초 제한)"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         response = requests.get(url, headers=headers, timeout=10) 
         response.raise_for_status()
-        
         img = PILImage.open(BytesIO(response.content))
         if img.mode in ("RGBA", "P"): img = img.convert("RGB")
         img.thumbnail((150, 150))
-        
         img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format="JPEG", quality=80)
+        img.save(img_byte_arr, format="JPEG")
         img_byte_arr.seek(0)
         return img_byte_arr
-    except:
-        return None
+    except: return None
 
 def search_with_retry(query, max_retries=3):
-    """검색 재시도 로직"""
     for attempt in range(max_retries):
         try:
-            results = DDGS().images(keywords=query, region="wt-wt", safesearch="off", max_results=15)
+            results = DDGS().images(keywords=query, region="wt-wt", safesearch="off", max_results=10)
             return [r['image'] for r in results if 'image' in r]
-        except Exception:
-            time.sleep(2 * (attempt + 1))
+        except: time.sleep(2 * (attempt + 1))
     return []
 
-# [NEW] 사용 가능한 비전 모델 자동 탐색 함수
-def fetch_vision_models(client):
-    """Groq API에 물어봐서 현재 사용 가능한 Vision 모델 리스트를 가져옴"""
-    try:
-        models = client.models.list()
-        # 모델 ID에 'vision'이나 'llava'가 포함된 것만 필터링
-        vision_models = [m.id for m in models.data if 'vision' in m.id or 'llava' in m.id]
-        
-        # 정렬 로직: '90b'가 들어간 고성능 모델을 앞으로, 나머지는 뒤로
-        vision_models.sort(key=lambda x: '90b' not in x) 
-        
-        if not vision_models:
-            # 만약 목록을 못 가져오면 기본값 강제 할당
-            return ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
-            
-        return vision_models
-    except Exception as e:
-        add_log(f"⚠️ 모델 목록 갱신 실패 (기본값 사용): {e}")
-        return ["llama-3.2-90b-vision-preview"]
-
-def verify_with_auto_model(client, url, product_name):
+def verify_with_multi_models(client, url, product_name):
     """
-    [핵심] 등록된 모델들을 순서대로 돌아가며 시도함.
-    하나가 망가져도 다음 모델로 자동 전환.
+    [핵심 수정] 
+    1. Llama 90b (최신)
+    2. Llava 7b (구형이지만 안정적)
+    순서로 시도하며, 에러 메시지를 정확히 출력함.
     """
-    # 세션에 저장된 모델 리스트가 없으면 가져옴
-    if not st.session_state.available_models:
-        st.session_state.available_models = fetch_vision_models(client)
-        add_log(f"📋 사용 가능 모델: {st.session_state.available_models}")
+    # 11b 모델은 죽었으므로 제거함
+    models_to_try = [
+        "llama-3.2-90b-vision-preview", # 1순위: 최신 고성능
+        "llava-v1.5-7b-4096-preview"    # 2순위: 비상용 (안정적)
+    ]
 
-    prompt = f"""
-    Does this image show the product '{product_name}'?
-    If it looks even slightly like the product, answer YES.
-    Answer NO only if it is completely wrong.
-    Answer YES or NO.
-    """
+    prompt = f"Does this image show '{product_name}'? Answer YES or NO."
 
-    # 모델 리스트를 순회하며 시도
-    for model_name in st.session_state.available_models:
+    for model_name in models_to_try:
         try:
             completion = client.chat.completions.create(
-                model=model_name, # 여기서 모델을 갈아끼움
+                model=model_name,
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": url}}]}],
                 temperature=0.1, 
                 max_tokens=5,
-                timeout=10.0 
+                timeout=15.0 
             )
             return "YES" in completion.choices[0].message.content.upper()
         
         except Exception as e:
-            # 에러 발생 시 로그 남기고 다음 모델로 넘어감
-            error_msg = str(e)
-            if "model_decommissioned" in error_msg or "404" in error_msg or "400" in error_msg:
-                add_log(f"⚠️ 모델({model_name}) 실패 -> 다음 모델 시도 중...")
-                continue # 다음 모델로!
+            err_msg = str(e)
+            # 로그에 정확한 에러 원인 기록
+            if "429" in err_msg:
+                add_log(f"⚠️ {model_name}: 사용량 초과(Rate Limit). 잠시 대기...")
+                time.sleep(5) # 429면 좀 오래 쉬어야 함
+            elif "400" in err_msg:
+                # 400 에러는 모델이 "이미지 URL을 못 읽겠다"는 뜻인 경우가 많음
+                add_log(f"⚠️ {model_name}: 이미지 URL 읽기 실패 (400)")
+            elif "404" in err_msg:
+                add_log(f"💀 {model_name}: 모델 서비스 종료됨 (404)")
             else:
-                return False # 모델 문제가 아닌 다른 에러면 그냥 실패 처리
+                add_log(f"⚠️ {model_name} 오류: {err_msg[:50]}...")
+            
+            # 다음 모델 시도
+            continue
 
-    return False # 모든 모델이 실패하면 False
+    return False # 모든 모델 실패
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
@@ -160,27 +134,22 @@ def create_excel(data_list, original_columns, target_count):
         pd.DataFrame(rows).to_excel(writer, index=False, sheet_name='Result')
         ws = writer.sheets['Result']
         ws.set_default_row(100)
-        
         for i, item in enumerate(data_list):
             row_idx = i + 1
             for img_idx, img_bytes in enumerate(item['images_data']):
                 if img_idx >= target_count: break
                 col_idx = len(original_columns) + 1 + img_idx
                 if img_bytes:
-                    ws.insert_image(row_idx, col_idx, "img.jpg", {
-                        'image_data': img_bytes, 'x_scale': 1, 'y_scale': 1, 'object_position': 1
-                    })
-                    if i == 0: ws.write(0, col_idx, f"이미지_{img_idx+1}")
+                    ws.insert_image(row_idx, col_idx, "img.jpg", {'image_data': img_bytes, 'x_scale': 1, 'y_scale': 1, 'object_position': 1})
     return output.getvalue()
 
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("🤖 Smart-Image-Finder (Auto-Update)")
-st.caption("새로운 AI 모델이 나오면 자동으로 찾아내어 적용합니다.")
+st.title("🚑 Smart-Image-Finder (Emergency Fix)")
+st.caption("Llama 모델 오류 시 Llava 모델로 자동 전환하며, 상세 에러를 표시합니다.")
 
-# 사이드바 (로그창)
-st.sidebar.title("작업 로그")
+st.sidebar.title("상세 로그")
 log_placeholder = st.sidebar.empty()
 
 try:
@@ -202,28 +171,20 @@ if uploaded_file and GROQ_API_KEY:
         st.session_state.processed_data = [] 
         st.session_state.is_processing = True
         st.session_state.stop_requested = False
-        st.session_state.available_models = [] # 모델 리스트 초기화 (새로 검색)
         st.rerun()
 
 # ---------------------------------------------------------
-# 5. 작업 실행 로직
+# 5. 실행 로직
 # ---------------------------------------------------------
 if st.session_state.is_processing:
     
     if st.button("🛑 중단하고 저장하기"):
         st.session_state.stop_requested = True
-        st.warning("마무리 중입니다...")
-
+    
     progress_bar = st.progress(0)
     status_box = st.empty()
     client = Groq(api_key=GROQ_API_KEY)
     
-    # [시작 시] 모델 목록 자동 갱신
-    if not st.session_state.available_models:
-        with st.spinner("최신 AI 모델 목록을 받아오는 중..."):
-            st.session_state.available_models = fetch_vision_models(client)
-            add_log(f"✅ 모델 자동 감지 완료: {len(st.session_state.available_models)}개 발견")
-
     start_idx = len(st.session_state.processed_data)
     total_rows = len(df)
     
@@ -234,38 +195,38 @@ if st.session_state.is_processing:
         full_name = f"{row[col_brand]} {row[col_model]}"
         
         status_box.markdown(f"**[{i+1}/{total_rows}]** 처리 중: `{full_name}`")
-        add_log(f"[{i+1}] {full_name} 검색")
+        add_log(f"▶ [{i+1}] {full_name}")
         
-        query = f"{full_name} product"
-        candidates = search_with_retry(query)
-        
-        valid_images_bytes = []
-        log_msg = ""
+        candidates = search_with_retry(f"{full_name} product")
+        valid_images = []
         
         if candidates:
-            for url in candidates[:12]: # 최대 12개 검토
-                if len(valid_images_bytes) >= target_count: break
+            # 최대 10개만 시도
+            for url in candidates[:10]:
+                if len(valid_images) >= target_count: break
                 
-                # [여기가 핵심] 자동으로 모델 돌려가며 검수
-                if verify_with_auto_model(client, url, full_name):
+                # [Llava 포함된 다중 검수]
+                if verify_with_multi_models(client, url, full_name):
+                    add_log(f"  ✅ AI 검수 통과!")
                     img_bytes = safe_download_image(url)
                     if img_bytes:
-                        valid_images_bytes.append(img_bytes)
+                        valid_images.append(img_bytes)
                         time.sleep(get_random_delay())
-            
-            log_msg = f"{len(valid_images_bytes)}장 찾음"
-            add_log(f" -> {log_msg}")
+        
+            msg = f"{len(valid_images)}장 확보"
+            add_log(f"  🏁 결과: {msg}")
         else:
-            add_log(" -> 검색 결과 없음")
-            log_msg = "검색 실패"
+            add_log("  ❌ 검색 결과 없음 (DuckDuckGo 차단됨)")
+            msg = "검색 실패"
             
         st.session_state.processed_data.append({
             'original_row': row.to_dict(),
-            'images_data': valid_images_bytes,
-            'status': log_msg
+            'images_data': valid_images,
+            'status': msg
         })
         
-        log_text = "\n".join(st.session_state.logs[-20:])
+        # 로그 업데이트 (최신 30줄)
+        log_text = "\n".join(st.session_state.logs[-30:])
         log_placeholder.code(log_text)
         progress_bar.progress((i + 1) / total_rows)
     
@@ -274,6 +235,5 @@ if st.session_state.is_processing:
 
 if len(st.session_state.processed_data) > 0:
     if st.button("📥 엑셀 파일 다운로드 생성"):
-        with st.spinner("엑셀 생성 중..."):
-            data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
-            st.download_button("다운로드", data, "Auto_Update_Result.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
+        st.download_button("다운로드", data, "Final_Result.xlsx")
