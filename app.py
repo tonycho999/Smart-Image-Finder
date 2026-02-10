@@ -14,7 +14,7 @@ from duckduckgo_search import DDGS
 # 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Smart-Image-Finder (Pro)",
+    page_title="Smart-Image-Finder (Final)",
     page_icon="⚡",
     layout="wide"
 )
@@ -52,11 +52,10 @@ def add_log(msg):
 # 3. 핵심 함수
 # ---------------------------------------------------------
 def get_random_delay():
-    # 봇 탐지 회피를 위한 랜덤 대기 (1.2초 ~ 2.5초)
     return random.uniform(1.2, 2.5)
 
 def get_best_gemini_model():
-    """모델 자동 선정 (Flash 우선)"""
+    """모델 자동 선정"""
     try:
         models = list(genai.list_models())
         candidates = []
@@ -64,17 +63,14 @@ def get_best_gemini_model():
             name = m.name.lower()
             if 'gemini' in name and 'pro' not in name and 'generateContent' in m.supported_generation_methods:
                 candidates.append(m.name)
-        
-        # 최신(숫자 큼) -> Flash 포함 순으로 정렬
         candidates.sort(key=lambda x: ('2.0' in x, 'flash' in x, x), reverse=True)
-        
         if candidates: return candidates[0]
         return 'gemini-1.5-flash'
     except:
         return 'gemini-1.5-flash'
 
 def safe_download_image(url):
-    """이미지 다운로드 (타임아웃 10초)"""
+    """이미지 다운로드"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     try:
         response = requests.get(url, headers=headers, timeout=10) 
@@ -86,8 +82,7 @@ def safe_download_image(url):
         return None
 
 def image_to_bytes(img):
-    """엑셀용 이미지 바이트 변환 (비율 유지 리사이징)"""
-    # 엑셀 셀 크기(약 130x130)에 맞게 썸네일 생성
+    """엑셀 저장용 이미지 바이트 변환"""
     img.thumbnail((130, 130))
     img_byte_arr = BytesIO()
     img.save(img_byte_arr, format="JPEG")
@@ -95,10 +90,8 @@ def image_to_bytes(img):
     return img_byte_arr
 
 def search_with_retry(query, max_retries=3):
-    """검색 재시도 로직"""
     for attempt in range(max_retries):
         try:
-            # 검색어에 'image'를 추가하거나 빼면서 시도
             q = query if attempt == 0 else query.replace(" product", "")
             results = DDGS().images(keywords=q, region="wt-wt", safesearch="off", max_results=20)
             return [r['image'] for r in results if 'image' in r]
@@ -108,26 +101,26 @@ def search_with_retry(query, max_retries=3):
 
 def verify_with_gemini(model_name, img, product_name):
     """
-    [기준 대폭 완화]
-    제품 사진처럼 보이면 무조건 YES를 하도록 유도
+    [수정됨] 이미지 전송 방식 변경 (오류 해결용)
     """
     try:
         model = genai.GenerativeModel(model_name)
         
-        # 프롬프트: '제품'이면 무조건 통과시켜라.
         prompt = f"""
-        Does this image look like a commercial product, item, or device related to '{product_name}'?
-        
-        Rules:
-        1. Answer YES if it shows ANY product.
-        2. Answer YES even if it has some text or white background is missing.
-        3. Answer NO only if it is an error message, a blank page, or map.
-        
-        Output only one word: YES or NO.
+        Does this image look like a product related to '{product_name}'?
+        Answer YES if it shows ANY product (shoes, clothes, box, etc).
+        Answer NO only if it is an error page, text only, or map.
+        Output only: YES or NO.
         """
         
+        # [핵심 수정] 이미지를 바로 보내지 않고, 바이트 데이터로 변환해서 전송 (더 안정적)
+        # PIL 이미지를 메모리상의 바이트로 변환
+        img_byte_arr = BytesIO()
+        img.save(img_byte_arr, format='JPEG')
+        img_blob = {'mime_type': 'image/jpeg', 'data': img_byte_arr.getvalue()}
+
         response = model.generate_content(
-            [prompt, img],
+            [prompt, img_blob],
             generation_config=GenerationConfig(max_output_tokens=10, temperature=0.1),
             request_options={'timeout': 10}
         )
@@ -140,14 +133,20 @@ def verify_with_gemini(model_name, img, product_name):
             return False, f"⛔ AI 거절"
             
     except Exception as e:
-        # 에러나면 그냥 통과시킴 (이미지 확보 우선)
-        return True, "⚠️ 에러(자동통과)"
+        err_msg = str(e)
+        # 로그에 정확한 에러 메시지 출력 (디버깅용)
+        if "429" in err_msg:
+            return True, "⚠️ 속도제한(자동통과)"
+        elif "API key not valid" in err_msg:
+            return True, "⚠️ 키 오류(자동통과)"
+        else:
+            # 에러 내용을 짧게 줄여서 로그에 표시
+            return True, f"⚠️ 에러({err_msg[:15]}...)"
 
 def create_excel(data_list, original_columns, target_count):
     output = BytesIO()
     rows = []
     
-    # 데이터 프레임 준비
     for item in data_list:
         row_data = item['original_row'].copy()
         row_data['처리결과'] = item['status']
@@ -160,58 +159,45 @@ def create_excel(data_list, original_columns, target_count):
         wb = writer.book
         ws = writer.sheets['Result']
         
-        # 행 높이 설정 (이미지가 들어갈 공간)
         ws.set_default_row(100)
-        
-        # 텍스트 줄바꿈 및 정렬
         fmt_text = wb.add_format({'text_wrap': True, 'valign': 'vcenter'})
         ws.set_column(0, len(original_columns), 15, fmt_text)
 
-        # 이미지/링크 삽입
-        # 기존 데이터 컬럼 + 1(처리결과) 다음부터 시작
         start_col = len(original_columns) + 1
         
-        # 헤더 쓰기
         for i in range(target_count):
-            ws.write(0, start_col + (i*2), f"이미지_{i+1}")
-            ws.write(0, start_col + (i*2) + 1, f"링크_{i+1}")
-            # 열 너비 조정 (이미지 칸은 넓게, 링크 칸은 좁게)
-            ws.set_column(start_col + (i*2), start_col + (i*2), 18) # 이미지칸
-            ws.set_column(start_col + (i*2) + 1, start_col + (i*2) + 1, 10, fmt_text) # 링크칸
+            ws.write(0, start_col + i, f"이미지_{i+1}")
+            ws.set_column(start_col + i, start_col + i, 18) 
 
         for i, item in enumerate(data_list):
             row_idx = i + 1
             
-            # 각 이미지별로 반복
             for k in range(target_count):
-                # k번째 이미지가 있는지 확인
                 if k < len(item['images_data']):
                     img_bytes = item['images_data'][k]
                     url_link = item['image_urls'][k]
                     
-                    # 1. 이미지 삽입
-                    col_img = start_col + (k*2)
+                    col_img = start_col + k
+                    
                     if img_bytes:
+                        # [핵심 수정] url 파라미터 추가 -> 사진 클릭 시 이동
                         ws.insert_image(row_idx, col_img, "img.jpg", {
                             'image_data': img_bytes,
                             'x_scale': 1, 'y_scale': 1,
-                            'object_position': 1 # 셀과 함께 이동 및 크기 변함
+                            'object_position': 1,
+                            'url': url_link  # 여기가 핵심: 이미지를 클릭하면 이 주소로 감
                         })
-                    
-                    # 2. 링크 삽입 (바로 옆 칸)
-                    col_link = start_col + (k*2) + 1
-                    ws.write_url(row_idx, col_link, url_link, string="[보기]")
 
     return output.getvalue()
 
 # ---------------------------------------------------------
 # 4. 메인 UI
 # ---------------------------------------------------------
-st.title("⚡ Smart-Image-Finder (Pro)")
-st.caption("AI 검수 기준 완화 & 엑셀 링크 기능 추가")
+st.title("⚡ Smart-Image-Finder (Clickable)")
+st.caption("사진을 클릭하면 원본 사이트로 이동합니다.")
 
 st.sidebar.title("설정 & 로그")
-use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True, help="체크 해제하면 무조건 다운로드합니다.")
+use_ai_check = st.sidebar.checkbox("AI 검수 사용하기", value=True)
 log_placeholder = st.sidebar.empty()
 
 try:
@@ -271,7 +257,7 @@ if st.session_state.is_processing:
         
         candidates = search_with_retry(f"{full_name} product")
         valid_images_bytes = []
-        valid_image_urls = [] # 링크 저장용
+        valid_image_urls = [] 
         
         if candidates:
             for url in candidates[:15]:
@@ -291,7 +277,7 @@ if st.session_state.is_processing:
                         img_bytes = image_to_bytes(pil_img)
                         
                         valid_images_bytes.append(img_bytes)
-                        valid_image_urls.append(url) # URL도 같이 저장
+                        valid_image_urls.append(url)
                         
                         if use_ai_check: time.sleep(get_random_delay())
                     else:
@@ -319,4 +305,4 @@ if st.session_state.is_processing:
 if len(st.session_state.processed_data) > 0:
     if st.button("📥 엑셀 파일 다운로드 생성"):
         data = create_excel(st.session_state.processed_data, df.columns.tolist(), target_count)
-        st.download_button("다운로드", data, "Final_Result.xlsx")
+        st.download_button("다운로드", data, "Clickable_Result.xlsx")
